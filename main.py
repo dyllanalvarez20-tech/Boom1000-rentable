@@ -7,6 +7,10 @@ from datetime import datetime
 import ssl
 from collections import deque
 import requests
+from flask import Flask, jsonify
+import atexit
+
+app = Flask(__name__)
 
 class BOOM1000MTFAnalyzer:
     def __init__(self, token, app_id="88258", telegram_token=None, telegram_chat_id=None):
@@ -45,6 +49,10 @@ class BOOM1000MTFAnalyzer:
         self.active_trade = None
         self.dominant_trend = "NEUTRAL"
         self.last_signal_time = 0; self.signal_cooldown = self.ltf_interval_seconds * 2
+
+        # Iniciar el analizador en un hilo separado
+        self.thread = threading.Thread(target=self.run_analyzer, daemon=True)
+        self.thread.start()
 
     # --- Métodos para calcular indicadores manualmente ---
     def calculate_ema(self, prices, period):
@@ -442,7 +450,7 @@ class BOOM1000MTFAnalyzer:
         print(f"   💰 Precio: {price:.2f} | 🎯 TP: {tp:.2f} | 🛑 SL: {sl:.2f} | 📊 RSI: {rsi_value:.1f}")
         print("="*70)
 
-    def run(self):
+    def run_analyzer(self):
         print("\n" + "="*70)
         print("🤖 ANALIZADOR MTF BOOM 1000 v4.1 (Indicadores Manuales)")
         print("="*70)
@@ -470,6 +478,46 @@ class BOOM1000MTFAnalyzer:
         else: 
             print("❌ No se pudo conectar a Deriv")
 
+# Crear instancia global del analizador
+analyzer = None
+
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "running",
+        "service": "BOOM1000 MTF Analyzer",
+        "connected": analyzer.connected if analyzer else False,
+        "dominant_trend": analyzer.dominant_trend if analyzer else "UNKNOWN",
+        "active_trade": analyzer.active_trade if analyzer else None,
+        "total_ltf_candles": len(analyzer.ltf_candles) if analyzer else 0
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({
+        "status": "healthy", 
+        "timestamp": datetime.now().isoformat(),
+        "connected": analyzer.connected if analyzer else False
+    })
+
+@app.route('/signals')
+def signals():
+    if not analyzer:
+        return jsonify({"error": "Analyzer not initialized"})
+    
+    return jsonify({
+        "dominant_trend": analyzer.dominant_trend,
+        "active_trade": analyzer.active_trade,
+        "last_signal_time": analyzer.last_signal_time
+    })
+
+def cleanup():
+    print("🛑 Cerrando conexiones...")
+    if analyzer and analyzer.ws:
+        analyzer.ws.close()
+
+atexit.register(cleanup)
+
 if __name__ == "__main__":
     DEMO_TOKEN = "a1-m63zGttjKYP6vUq8SIJdmySH8d3Jc"
     
@@ -482,4 +530,7 @@ if __name__ == "__main__":
         telegram_token=TELEGRAM_BOT_TOKEN, 
         telegram_chat_id=TELEGRAM_CHAT_ID
     )
-    analyzer.run()
+    
+    # Iniciar servidor Flask
+    print("🚀 Iniciando servidor Flask...")
+    app.run(host='0.0.0.0', port=10000, debug=False)
