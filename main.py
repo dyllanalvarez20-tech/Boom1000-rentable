@@ -3,7 +3,6 @@ import json
 import threading
 import time
 import numpy as np
-import pandas_ta as ta
 from datetime import datetime
 import ssl
 from collections import deque
@@ -46,6 +45,82 @@ class BOOM1000MTFAnalyzer:
         self.active_trade = None
         self.dominant_trend = "NEUTRAL"
         self.last_signal_time = 0; self.signal_cooldown = self.ltf_interval_seconds * 2
+
+    # --- Métodos para calcular indicadores manualmente ---
+    def calculate_ema(self, prices, period):
+        """Calcula EMA manualmente"""
+        if len(prices) < period:
+            return np.array([np.nan] * len(prices))
+        
+        ema = np.zeros(len(prices))
+        k = 2 / (period + 1)
+        
+        # Primer valor EMA es SMA simple
+        ema[period-1] = np.mean(prices[:period])
+        
+        # Calcular EMA para los valores restantes
+        for i in range(period, len(prices)):
+            ema[i] = (prices[i] * k) + (ema[i-1] * (1 - k))
+        
+        return ema
+
+    def calculate_rsi(self, prices, period=14):
+        """Calcula RSI manualmente"""
+        if len(prices) < period + 1:
+            return np.array([np.nan] * len(prices))
+        
+        deltas = np.diff(prices)
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        
+        avg_gain = np.zeros(len(prices))
+        avg_loss = np.zeros(len(prices))
+        rsi = np.zeros(len(prices))
+        
+        # Valores iniciales
+        avg_gain[period] = np.mean(gains[:period])
+        avg_loss[period] = np.mean(losses[:period])
+        
+        for i in range(period + 1, len(prices)):
+            avg_gain[i] = (avg_gain[i-1] * (period - 1) + gains[i-1]) / period
+            avg_loss[i] = (avg_loss[i-1] * (period - 1) + losses[i-1]) / period
+        
+        for i in range(period, len(prices)):
+            if avg_loss[i] == 0:
+                rsi[i] = 100
+            else:
+                rs = avg_gain[i] / avg_loss[i]
+                rsi[i] = 100 - (100 / (1 + rs))
+        
+        return rsi
+
+    def calculate_atr(self, highs, lows, closes, period=14):
+        """Calcula ATR manualmente"""
+        if len(highs) < period + 1:
+            return np.array([np.nan] * len(highs))
+        
+        tr = np.zeros(len(highs))
+        atr = np.zeros(len(highs))
+        
+        # Calcular True Range
+        for i in range(1, len(highs)):
+            hl = highs[i] - lows[i]
+            hc = abs(highs[i] - closes[i-1])
+            lc = abs(lows[i] - closes[i-1])
+            tr[i] = max(hl, hc, lc)
+        
+        # Primer ATR es el promedio simple de los primeros period TR
+        atr[period] = np.mean(tr[1:period+1])
+        
+        # Calcular ATR para los valores restantes
+        for i in range(period + 1, len(highs)):
+            atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
+        
+        return atr
+
+    def calculate_volume_ema(self, volumes, period=20):
+        """Calcula EMA de volumen manualmente"""
+        return self.calculate_ema(volumes, period)
 
     def send_telegram_message(self, message):
         """Envía un mensaje a través de Telegram"""
@@ -146,7 +221,6 @@ class BOOM1000MTFAnalyzer:
         self.ticks_for_current_candle = []
         self.new_ltf_candle_ready = True
 
-        # ✅ MEJORA: Añadir feedback de la recopilación inicial de velas
         if len(self.ltf_candles) < self.min_ltf_candles:
             print(f"\r⏳ Recopilando velas iniciales (1min): {len(self.ltf_candles)}/{self.min_ltf_candles}", end="")
         elif len(self.ltf_candles) == self.min_ltf_candles:
@@ -182,26 +256,23 @@ class BOOM1000MTFAnalyzer:
         self.htf_candles.append(htf_candle)
 
         if len(self.htf_candles) >= self.min_htf_candles:
-            # Convertir a DataFrame para pandas_ta
-            import pandas as pd
-            df_htf = pd.DataFrame(list(self.htf_candles))
-            
-            # Calcular EMA usando pandas_ta
-            htf_ema = ta.ema(df_htf['close'], length=self.htf_trend_ema_period)
+            # Calcular EMA manualmente para la tendencia HTF
+            htf_closes = np.array([c['close'] for c in self.htf_candles], dtype=float)
+            htf_ema = self.calculate_ema(htf_closes, self.htf_trend_ema_period)
             
             old_trend = self.dominant_trend
-            if df_htf['close'].iloc[-1] > htf_ema.iloc[-1]: 
-                self.dominant_trend = "UP"
-            elif df_htf['close'].iloc[-1] < htf_ema.iloc[-1]: 
-                self.dominant_trend = "DOWN"
-            else: 
-                self.dominant_trend = "NEUTRAL"
+            if not np.isnan(htf_ema[-1]):
+                if htf_closes[-1] > htf_ema[-1]: 
+                    self.dominant_trend = "UP"
+                elif htf_closes[-1] < htf_ema[-1]: 
+                    self.dominant_trend = "DOWN"
+                else: 
+                    self.dominant_trend = "NEUTRAL"
 
             if self.dominant_trend != old_trend and self.dominant_trend != "NEUTRAL":
                 trend_color = "\033[92m" if self.dominant_trend == "UP" else "\033[91m"
                 print(f"\n{trend_color}📈 TENDENCIA DOMINANTE (5min) CAMBIÓ A: {self.dominant_trend}\033[0m")
                 
-                # Enviar notificación de cambio de tendencia a Telegram
                 if self.telegram_enabled:
                     trend_emoji = "📈" if self.dominant_trend == "UP" else "📉"
                     message = f"{trend_emoji} <b>TENDENCIA CAMBIADA</b>\n\n"
@@ -222,26 +293,19 @@ class BOOM1000MTFAnalyzer:
         closes = np.array([c['close'] for c in self.ltf_candles], dtype=float)
         volumes = np.array([c['volume'] for c in self.ltf_candles], dtype=float)
 
-        # Convertir a DataFrame para pandas_ta
-        import pandas as pd
-        df = pd.DataFrame({
-            'open': opens, 'high': highs, 'low': lows, 
-            'close': closes, 'volume': volumes
-        })
-
-        # Calcular indicadores con pandas_ta
-        ema_fast = ta.ema(df['close'], length=self.ema_fast_period)
-        ema_slow = ta.ema(df['close'], length=self.ema_slow_period)
-        ema_trend = ta.ema(df['close'], length=self.ema_trend_period)
-        rsi = ta.rsi(df['close'], length=self.rsi_period)
-        atr = ta.atr(df['high'], df['low'], df['close'], length=self.atr_period)
-        volume_ema = ta.ema(df['volume'], length=self.volume_ema_period)
+        # Calcular indicadores manualmente
+        ema_fast = self.calculate_ema(closes, self.ema_fast_period)
+        ema_slow = self.calculate_ema(closes, self.ema_slow_period)
+        ema_trend = self.calculate_ema(closes, self.ema_trend_period)
+        rsi = self.calculate_rsi(closes, self.rsi_period)
+        atr = self.calculate_atr(highs, lows, closes, self.atr_period)
+        volume_ema = self.calculate_volume_ema(volumes, self.volume_ema_period)
         
-        # Calcular patrón engulfing manualmente (pandas_ta no tiene CDLENGULFING)
-        engulfing = np.zeros(len(df))
-        for i in range(1, len(df)):
-            prev_open, prev_close = df['open'].iloc[i-1], df['close'].iloc[i-1]
-            curr_open, curr_close = df['open'].iloc[i], df['close'].iloc[i]
+        # Calcular patrón engulfing manualmente
+        engulfing = np.zeros(len(closes))
+        for i in range(1, len(closes)):
+            prev_open, prev_close = opens[i-1], closes[i-1]
+            curr_open, curr_close = opens[i], closes[i]
             
             # Bullish engulfing
             if (curr_close > curr_open and prev_close < prev_open and 
@@ -252,9 +316,14 @@ class BOOM1000MTFAnalyzer:
                   curr_open > prev_close and curr_close < prev_open):
                 engulfing[i] = -100
 
+        # Verificar si tenemos datos suficientes
+        if (np.isnan(ema_fast[-1]) or np.isnan(ema_slow[-1]) or np.isnan(ema_trend[-1]) or 
+            np.isnan(rsi[-1]) or np.isnan(atr[-1]) or np.isnan(volume_ema[-1])):
+            return
+
         last_close = closes[-1]
-        last_atr = atr.iloc[-1] if not atr.empty else 0
-        is_volume_spike = volumes[-1] > volume_ema.iloc[-1] * 1.2 if not volume_ema.empty else False
+        last_atr = atr[-1]
+        is_volume_spike = volumes[-1] > volume_ema[-1] * 1.2
         is_bullish_engulfing = engulfing[-1] == 100
         is_bearish_engulfing = engulfing[-1] == -100
 
@@ -265,40 +334,35 @@ class BOOM1000MTFAnalyzer:
             return
 
         if self.dominant_trend == "UP":
-            is_uptrend_ltf = (not ema_fast.empty and not ema_slow.empty and not ema_trend.empty and
-                             ema_fast.iloc[-1] > ema_slow.iloc[-1] and ema_slow.iloc[-1] > ema_trend.iloc[-1])
-            is_ema_cross_up = (len(ema_fast) > 1 and len(ema_slow) > 1 and
-                              ema_fast.iloc[-2] <= ema_slow.iloc[-2] and ema_fast.iloc[-1] > ema_slow.iloc[-1])
+            is_uptrend_ltf = ema_fast[-1] > ema_slow[-1] and ema_slow[-1] > ema_trend[-1]
+            is_ema_cross_up = len(ema_fast) > 1 and ema_fast[-2] <= ema_slow[-2] and ema_fast[-1] > ema_slow[-1]
             
             if is_uptrend_ltf and is_ema_cross_up and is_volume_spike:
                 signal = "BUY"
                 reason = "Cruce de EMAs (LTF) con Tendencia (HTF)"
-            if is_bullish_engulfing and is_uptrend_ltf and (not rsi.empty and rsi.iloc[-1] < 75) and is_volume_spike:
+            if is_bullish_engulfing and is_uptrend_ltf and rsi[-1] < 75 and is_volume_spike:
                 signal = "BUY"
                 reason = "Vela Envolvente (LTF) con Tendencia (HTF)"
 
         if self.dominant_trend == "DOWN":
-            is_downtrend_ltf = (not ema_fast.empty and not ema_slow.empty and not ema_trend.empty and
-                               ema_fast.iloc[-1] < ema_slow.iloc[-1] and ema_slow.iloc[-1] < ema_trend.iloc[-1])
-            is_ema_cross_down = (len(ema_fast) > 1 and len(ema_slow) > 1 and
-                                ema_fast.iloc[-2] >= ema_slow.iloc[-2] and ema_fast.iloc[-1] < ema_slow.iloc[-1])
+            is_downtrend_ltf = ema_fast[-1] < ema_slow[-1] and ema_slow[-1] < ema_trend[-1]
+            is_ema_cross_down = len(ema_fast) > 1 and ema_fast[-2] >= ema_slow[-2] and ema_fast[-1] < ema_slow[-1]
             
             if is_downtrend_ltf and is_ema_cross_down and is_volume_spike:
                 signal = "SELL"
                 reason = "Cruce de EMAs (LTF) con Tendencia (HTF)"
-            if is_bearish_engulfing and is_downtrend_ltf and (not rsi.empty and rsi.iloc[-1] > 25) and is_volume_spike:
+            if is_bearish_engulfing and is_downtrend_ltf and rsi[-1] > 25 and is_volume_spike:
                 signal = "SELL"
                 reason = "Vela Envolvente (LTF) con Tendencia (HTF)"
 
         if signal:
             self.last_signal_time = time.time()
-            self.display_signal(signal, reason, last_close, last_atr, rsi.iloc[-1] if not rsi.empty else 50)
+            self.display_signal(signal, reason, last_close, last_atr, rsi[-1])
             sl, tp = self.calculate_tp_sl(signal, last_close, last_atr)
             self.active_trade = {"direction": signal, "entry": last_close, "sl": sl, "tp": tp}
             
-            # Enviar señal a Telegram
             if self.telegram_enabled:
-                self.send_signal_to_telegram(signal, reason, last_close, sl, tp, rsi.iloc[-1] if not rsi.empty else 50)
+                self.send_signal_to_telegram(signal, reason, last_close, sl, tp, rsi[-1])
 
     def send_signal_to_telegram(self, signal, reason, price, sl, tp, rsi):
         """Envía una señal de trading a Telegram"""
@@ -342,7 +406,6 @@ class BOOM1000MTFAnalyzer:
         if exit_reason:
             print(f"\n🔔 CIERRE DE OPERACIÓN ({trade['direction']}): {exit_reason} en {last_price:.2f}")
             
-            # Enviar notificación de cierre a Telegram
             if self.telegram_enabled:
                 result_emoji = "✅" if exit_reason == "Take Profit" else "❌"
                 message = f"{result_emoji} <b>OPERACIÓN CERRADA</b> {result_emoji}\n\n"
@@ -381,7 +444,7 @@ class BOOM1000MTFAnalyzer:
 
     def run(self):
         print("\n" + "="*70)
-        print("🤖 ANALIZADOR MTF BOOM 1000 v4.1 (Pandas TA)")
+        print("🤖 ANALIZADOR MTF BOOM 1000 v4.1 (Indicadores Manuales)")
         print("="*70)
         print("💡 ESTRATEGIA: Tendencia en 5min (HTF) + Entradas en 1min (LTF)")
         
@@ -410,7 +473,7 @@ class BOOM1000MTFAnalyzer:
 if __name__ == "__main__":
     DEMO_TOKEN = "a1-m63zGttjKYP6vUq8SIJdmySH8d3Jc"
     
-    # Configuración de Telegram (reemplaza con tus propios valores)
+    # Configuración de Telegram
     TELEGRAM_BOT_TOKEN = "7868591681:AAGYeuSUwozg3xTi1zmxPx9gWRP2xsXP0Uc"
     TELEGRAM_CHAT_ID = "-1003028922957"
     
