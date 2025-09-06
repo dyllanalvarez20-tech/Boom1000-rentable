@@ -18,6 +18,8 @@ class BOOM1000MTFAnalyzer:
         self.ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id}"
         self.token = token
         self.ws = None; self.connected = False; self.authenticated = False
+        self.last_reconnect_attempt = 0
+        self.reconnect_interval = 60  # 1 minuto entre intentos de reconexión
         
         # --- Configuración de Telegram ---
         self.telegram_token = telegram_token
@@ -35,7 +37,7 @@ class BOOM1000MTFAnalyzer:
         self.ema_fast_period = 9; self.ema_slow_period = 21; self.ema_trend_period = 50
         self.rsi_period = 14; self.atr_period = 14; self.volume_ema_period = 20
         self.htf_trend_ema_period = 21
-        self.sl_atr_multiplier = 1.5; self.tp_atr_multiplier = 2.0
+        self.sl_atr_multiplier = 2.0; self.tp_atr_multiplier = 3.0
 
         # --- Almacenamiento de Datos ---
         self.ltf_candles = deque(maxlen=200)
@@ -149,30 +151,64 @@ class BOOM1000MTFAnalyzer:
             return False
 
     def connect(self):
-        print("🌐 Conectando a Deriv API...")
-        self.ws = websocket.WebSocketApp(
-            self.ws_url, 
-            on_open=self.on_open, 
-            on_message=self.on_message, 
-            on_error=self.on_error, 
-            on_close=self.on_close
-        )
-        wst = threading.Thread(
-            target=self.ws.run_forever, 
-            kwargs={'sslopt': {"cert_reqs": ssl.CERT_NONE}, 'ping_interval': 30, 'ping_timeout': 10}
-        )
-        wst.daemon = True
-        wst.start()
-        time.sleep(5)
-        return self.connected
+        """Conecta a Deriv API con manejo de errores mejorado"""
+        try:
+            print("🌐 Conectando a Deriv API...")
+            self.ws = websocket.WebSocketApp(
+                self.ws_url, 
+                on_open=self.on_open, 
+                on_message=self.on_message, 
+                on_error=self.on_error, 
+                on_close=self.on_close
+            )
+            wst = threading.Thread(
+                target=self.ws.run_forever, 
+                kwargs={'sslopt': {"cert_reqs": ssl.CERT_NONE}, 'ping_interval': 30, 'ping_timeout': 10}
+            )
+            wst.daemon = True
+            wst.start()
+            
+            # Esperar a que se conecte con timeout
+            timeout = 15
+            start_time = time.time()
+            while not self.connected and time.time() - start_time < timeout:
+                time.sleep(0.1)
+                
+            if self.connected:
+                print("✅ Conexión exitosa a Deriv API")
+                return True
+            else:
+                print("❌ Timeout en conexión a Deriv API")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Error en conexión: {e}")
+            return False
+
+    def disconnect(self):
+        """Desconecta limpiamente"""
+        if self.ws:
+            try:
+                self.ws.close()
+            except:
+                pass
+        self.connected = False
+        self.authenticated = False
+
+    def force_reconnect(self):
+        """Fuerza reconexión inmediata"""
+        print("🔄 Forzando reconexión inmediata...")
+        self.disconnect()
+        time.sleep(2)
+        return self.connect()
 
     def on_open(self, ws): 
-        print("✅ Conexión abierta")
+        print("✅ Conexión WebSocket abierta")
         self.connected = True
         ws.send(json.dumps({"authorize": self.token}))
 
     def on_close(self, ws, code, msg): 
-        print("🔌 Conexión cerrada")
+        print("🔌 Conexión WebSocket cerrada")
         self.connected = False
         self.authenticated = False
 
@@ -463,20 +499,46 @@ class BOOM1000MTFAnalyzer:
         
         print("="*70)
         
-        if self.connect():
+        # Bucle principal con reconexión automática agresiva
+        while True:
             try:
-                while self.connected:
-                    if self.new_ltf_candle_ready:
-                        if self.active_trade: 
-                            self.check_active_trade()
-                        else: 
-                            self.analyze_market()
-                        self.new_ltf_candle_ready = False
-                    time.sleep(1)
-            except KeyboardInterrupt: 
-                print("\n🛑 Deteniendo analizador...")
-        else: 
-            print("❌ No se pudo conectar a Deriv")
+                current_time = time.time()
+                
+                # Reconectar si no está conectado o cada 5 minutos
+                if not self.connected or current_time - self.last_reconnect_attempt > 300:
+                    self.last_reconnect_attempt = current_time
+                    
+                    if not self.connected:
+                        print("🔄 Intentando reconexión automática...")
+                    else:
+                        print("🔄 Reconexión programada cada 5 minutos...")
+                    
+                    if self.connect():
+                        print("✅ Reconexión exitosa")
+                        # Bucle de análisis mientras esté conectado
+                        while self.connected:
+                            if self.new_ltf_candle_ready:
+                                if self.active_trade: 
+                                    self.check_active_trade()
+                                else: 
+                                    self.analyze_market()
+                                self.new_ltf_candle_ready = False
+                            time.sleep(1)
+                    else:
+                        print("❌ No se pudo conectar, reintentando en 30 segundos...")
+                        time.sleep(30)
+                else:
+                    # Esperar hasta la próxima reconexión
+                    time_until_reconnect = 300 - (current_time - self.last_reconnect_attempt)
+                    if time_until_reconnect > 0:
+                        sleep_time = min(30, time_until_reconnect)
+                        print(f"⏰ Próxima reconexión en {time_until_reconnect:.0f} segundos")
+                        time.sleep(sleep_time)
+                    
+            except Exception as e:
+                print(f"❌ Error crítico en run_analyzer: {e}")
+                print("🔄 Reintentando en 30 segundos...")
+                time.sleep(30)
 
 # Crear instancia global del analizador
 analyzer = None
@@ -487,9 +549,12 @@ def home():
         "status": "running",
         "service": "BOOM1000 MTF Analyzer",
         "connected": analyzer.connected if analyzer else False,
-        "dominant_trend": analyzer.dominant_trend if analyzer else "UNKNOWN",
+        "authenticated": analyzer.authenticated if analyzer else False,
+        "dominant_trend": analyzer.dominant_trend if analyzer else "NEUTRAL",
         "active_trade": analyzer.active_trade if analyzer else None,
-        "total_ltf_candles": len(analyzer.ltf_candles) if analyzer else 0
+        "total_ltf_candles": len(analyzer.ltf_candles) if analyzer else 0,
+        "last_reconnect": analyzer.last_reconnect_attempt if analyzer else 0,
+        "next_reconnect": (analyzer.last_reconnect_attempt + 300 - time.time()) if analyzer and analyzer.last_reconnect_attempt else 0
     })
 
 @app.route('/health')
@@ -497,7 +562,8 @@ def health():
     return jsonify({
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
-        "connected": analyzer.connected if analyzer else False
+        "connected": analyzer.connected if analyzer else False,
+        "authenticated": analyzer.authenticated if analyzer else False
     })
 
 @app.route('/signals')
@@ -508,7 +574,32 @@ def signals():
     return jsonify({
         "dominant_trend": analyzer.dominant_trend,
         "active_trade": analyzer.active_trade,
-        "last_signal_time": analyzer.last_signal_time
+        "last_signal_time": analyzer.last_signal_time,
+        "total_signals": len(analyzer.ltf_candles) - 50 if len(analyzer.ltf_candles) > 50 else 0
+    })
+
+@app.route('/reconnect')
+def manual_reconnect():
+    if not analyzer:
+        return jsonify({"error": "Analyzer not initialized"})
+    
+    analyzer.last_reconnect_attempt = 0  # Forzar reconexión inmediata
+    return jsonify({"status": "reconnection_triggered", "message": "Se forzará la reconexión en el próximo ciclo"})
+
+@app.route('/debug')
+def debug():
+    if not analyzer:
+        return jsonify({"error": "Analyzer not initialized"})
+    
+    return jsonify({
+        "connected": analyzer.connected,
+        "authenticated": analyzer.authenticated,
+        "websocket_status": "open" if analyzer.ws and analyzer.connected else "closed",
+        "ltf_candles": len(analyzer.ltf_candles),
+        "htf_candles": len(analyzer.htf_candles),
+        "ticks_in_current_candle": len(analyzer.ticks_for_current_candle),
+        "last_reconnect_attempt": analyzer.last_reconnect_attempt,
+        "dominant_trend": analyzer.dominant_trend
     })
 
 def cleanup():
