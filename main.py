@@ -29,9 +29,9 @@ class BOOM1000MTFAnalyzer:
         # --- 📈 MTF: Configuración de Timeframes ---
         self.symbol = "BOOM1000"
         self.ltf_interval_seconds = 60
-        self.htf_interval_seconds = 300
+        self.htf_interval_seconds = 900
         self.min_ltf_candles = 50
-        self.min_htf_candles = 10
+        self.min_htf_candles = 20
 
         # --- Parámetros de la Estrategia ---
         self.ema_fast_period = 9; self.ema_slow_period = 21; self.ema_trend_period = 50
