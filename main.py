@@ -3,7 +3,6 @@ import json
 import threading
 import time
 import numpy as np
-import pandas as pd
 from datetime import datetime
 import ssl
 from collections import deque
@@ -22,7 +21,7 @@ class BOOM1000CandleAnalyzer:
         self.connected = False
         self.authenticated = False
         self.last_reconnect_time = time.time()
-        self.service_url = "https://boom-1000-index-se-ales.onrender.com"
+        self.service_url = "https://boom1000-rentable.onrender.com"
 
         # --- Configuración de Telegram ---
         self.telegram_token = telegram_token
