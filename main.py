@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import numpy as np
+import pandas as pd
 from datetime import datetime
 import ssl
 from collections import deque
@@ -12,51 +13,104 @@ import atexit
 
 app = Flask(__name__)
 
-class BOOM1000MTFAnalyzer:
+class BOOM1000CandleAnalyzer:
     def __init__(self, token, app_id="88258", telegram_token=None, telegram_chat_id=None):
         # --- Configuración de Conexión ---
         self.ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id}"
         self.token = token
-        self.ws = None; self.connected = False; self.authenticated = False
-        self.last_reconnect_attempt = 0
-        self.reconnect_interval = 60  # 1 minuto entre intentos de reconexión
-        
+        self.ws = None
+        self.connected = False
+        self.authenticated = False
+        self.last_reconnect_time = time.time()
+        self.service_url = "https://boom-1000-index-se-ales.onrender.com"
+
         # --- Configuración de Telegram ---
         self.telegram_token = telegram_token
         self.telegram_chat_id = telegram_chat_id
         self.telegram_enabled = telegram_token is not None and telegram_chat_id is not None
 
-        # --- 📈 MTF: Configuración de Timeframes ---
+        # --- Configuración de Trading ---
         self.symbol = "BOOM1000"
-        self.ltf_interval_seconds = 60
-        self.htf_interval_seconds = 900
-        self.min_ltf_candles = 50
-        self.min_htf_candles = 20
+        self.candle_interval_seconds = 60
+        self.min_candles = 50
 
-        # --- Parámetros de la Estrategia ---
-        self.ema_fast_period = 9; self.ema_slow_period = 21; self.ema_trend_period = 50
-        self.rsi_period = 14; self.atr_period = 14; self.volume_ema_period = 20
-        self.htf_trend_ema_period = 21
-        self.sl_atr_multiplier = 2.0; self.tp_atr_multiplier = 3.0
+        # --- Parámetros Mejorados de la Estrategia ---
+        self.ema_fast_period = 12
+        self.ema_slow_period = 26
+        self.ema_trend_period = 50
+        self.macd_fast = 12
+        self.macd_slow = 26
+        self.macd_signal = 9
+        self.rsi_period = 14
+        self.stoch_k = 14
+        self.stoch_d = 3
+        self.stoch_slow = 3
+        self.atr_period = 14
+        self.sl_atr_multiplier = 3.0
+        self.tp_atr_multiplier = 4.0
+        self.volume_ma_period = 20
 
         # --- Almacenamiento de Datos ---
-        self.ltf_candles = deque(maxlen=200)
-        self.htf_candles = deque(maxlen=100)
         self.ticks_for_current_candle = []
-        self.last_ltf_candle_timestamp = 0
-        self.last_htf_candle_timestamp = 0
-        self.new_ltf_candle_ready = False
+        self.candles = deque(maxlen=200)
+        self.last_candle_timestamp = 0
+        self.new_candle_ready = False
 
-        # --- Estado de Trading ---
-        self.active_trade = None
-        self.dominant_trend = "NEUTRAL"
-        self.last_signal_time = 0; self.signal_cooldown = self.ltf_interval_seconds * 2
+        # --- Estado de Señales ---
+        self.last_signal_time = 0
+        self.signal_cooldown = self.candle_interval_seconds * 3
+        self.last_signal = None
+        self.signals_history = []
+        self.consecutive_signals = 0
+        self.max_consecutive_signals = 2
 
-        # Iniciar el analizador en un hilo separado
+        # Iniciar en un hilo separado
         self.thread = threading.Thread(target=self.run_analyzer, daemon=True)
         self.thread.start()
 
+    def self_ping(self):
+        """Función para hacerse ping a sí mismo y evitar que Render duerma el servicio"""
+        try:
+            health_url = f"{self.service_url}/health"
+            response = requests.get(health_url, timeout=10)
+            print(f"✅ Self-ping exitoso: {response.status_code}")
+            return True
+        except Exception as e:
+            print(f"❌ Error en self-ping: {e}")
+            return False
+
     # --- Métodos para calcular indicadores manualmente ---
+    def calculate_indicators(self, closes, highs, lows, volumes):
+        """Calcula todos los indicadores necesarios manualmente"""
+        indicators = {}
+
+        # EMA
+        indicators['ema_fast'] = self.calculate_ema(closes, self.ema_fast_period)
+        indicators['ema_slow'] = self.calculate_ema(closes, self.ema_slow_period)
+        indicators['ema_trend'] = self.calculate_ema(closes, self.ema_trend_period)
+
+        # MACD
+        macd, macd_signal = self.calculate_macd(closes, self.macd_fast, self.macd_slow, self.macd_signal)
+        indicators['macd'] = macd
+        indicators['macd_signal'] = macd_signal
+        indicators['macd_hist'] = macd - macd_signal
+
+        # RSI
+        indicators['rsi'] = self.calculate_rsi(closes, self.rsi_period)
+
+        # Estocástico
+        stoch_k, stoch_d = self.calculate_stochastic(highs, lows, closes, self.stoch_k, self.stoch_d, self.stoch_slow)
+        indicators['stoch_k'] = stoch_k
+        indicators['stoch_d'] = stoch_d
+
+        # ATR
+        indicators['atr'] = self.calculate_atr(highs, lows, closes, self.atr_period)
+
+        # Volumen MA
+        indicators['volume_ma'] = self.calculate_sma(volumes, self.volume_ma_period)
+
+        return indicators
+
     def calculate_ema(self, prices, period):
         """Calcula EMA manualmente"""
         if len(prices) < period:
@@ -73,6 +127,34 @@ class BOOM1000MTFAnalyzer:
             ema[i] = (prices[i] * k) + (ema[i-1] * (1 - k))
         
         return ema
+
+    def calculate_sma(self, values, period):
+        """Calcula SMA manualmente"""
+        if len(values) < period:
+            return np.array([np.nan] * len(values))
+        
+        sma = np.zeros(len(values))
+        for i in range(period-1, len(values)):
+            sma[i] = np.mean(values[i-period+1:i+1])
+        
+        return sma
+
+    def calculate_macd(self, prices, fast_period=12, slow_period=26, signal_period=9):
+        """Calcula MACD manualmente"""
+        if len(prices) < slow_period + signal_period:
+            return np.zeros(len(prices)), np.zeros(len(prices))
+        
+        # Calcular EMAs rápidas y lentas
+        ema_fast = self.calculate_ema(prices, fast_period)
+        ema_slow = self.calculate_ema(prices, slow_period)
+        
+        # MACD es la diferencia entre las EMAs
+        macd_line = ema_fast - ema_slow
+        
+        # Señal es la EMA del MACD
+        signal_line = self.calculate_ema(macd_line, signal_period)
+        
+        return macd_line, signal_line
 
     def calculate_rsi(self, prices, period=14):
         """Calcula RSI manualmente"""
@@ -104,6 +186,33 @@ class BOOM1000MTFAnalyzer:
         
         return rsi
 
+    def calculate_stochastic(self, highs, lows, closes, k_period=14, d_period=3, slow=3):
+        """Calcula Estocástico manualmente"""
+        if len(highs) < k_period + d_period:
+            return np.zeros(len(highs)), np.zeros(len(highs))
+        
+        stoch_k = np.zeros(len(highs))
+        
+        for i in range(k_period-1, len(highs)):
+            highest_high = np.max(highs[i-k_period+1:i+1])
+            lowest_low = np.min(lows[i-k_period+1:i+1])
+            
+            if highest_high != lowest_low:
+                stoch_k[i] = 100 * (closes[i] - lowest_low) / (highest_high - lowest_low)
+            else:
+                stoch_k[i] = 50  # Valor neutral si no hay rango
+        
+        # Suavizar con período lento
+        if slow > 1:
+            stoch_k_smoothed = self.calculate_sma(stoch_k, slow)
+        else:
+            stoch_k_smoothed = stoch_k
+        
+        # Calcular línea D (media móvil de K)
+        stoch_d = self.calculate_sma(stoch_k_smoothed, d_period)
+        
+        return stoch_k_smoothed, stoch_d
+
     def calculate_atr(self, highs, lows, closes, period=14):
         """Calcula ATR manualmente"""
         if len(highs) < period + 1:
@@ -128,15 +237,12 @@ class BOOM1000MTFAnalyzer:
         
         return atr
 
-    def calculate_volume_ema(self, volumes, period=20):
-        """Calcula EMA de volumen manualmente"""
-        return self.calculate_ema(volumes, period)
-
+    # --- Método para enviar mensajes a Telegram ---
     def send_telegram_message(self, message):
-        """Envía un mensaje a través de Telegram"""
         if not self.telegram_enabled:
+            print("❌ Telegram no está configurado. No se enviará mensaje.")
             return False
-            
+
         try:
             url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
             payload = {
@@ -145,396 +251,355 @@ class BOOM1000MTFAnalyzer:
                 "parse_mode": "HTML"
             }
             response = requests.post(url, json=payload, timeout=10)
-            return response.status_code == 200
+            if response.status_code == 200:
+                print("✅ Señal enviada a Telegram")
+                return True
+            else:
+                print(f"❌ Error al enviar a Telegram: {response.status_code} - {response.text}")
+                return False
         except Exception as e:
-            print(f"❌ Error enviando mensaje a Telegram: {e}")
+            print(f"❌ Excepción al enviar a Telegram: {e}")
             return False
 
+    # --- Métodos de Conexión ---
     def connect(self):
-        """Conecta a Deriv API con manejo de errores mejorado"""
+        print("🌐 Conectando a Deriv API...")
         try:
-            print("🌐 Conectando a Deriv API...")
             self.ws = websocket.WebSocketApp(
-                self.ws_url, 
-                on_open=self.on_open, 
-                on_message=self.on_message, 
-                on_error=self.on_error, 
+                self.ws_url,
+                on_open=self.on_open,
+                on_message=self.on_message,
+                on_error=self.on_error,
                 on_close=self.on_close
             )
-            wst = threading.Thread(
-                target=self.ws.run_forever, 
-                kwargs={'sslopt': {"cert_reqs": ssl.CERT_NONE}, 'ping_interval': 30, 'ping_timeout': 10}
-            )
+            wst = threading.Thread(target=self.ws.run_forever, kwargs={
+                'sslopt': {"cert_reqs": ssl.CERT_NONE}, 'ping_interval': 30, 'ping_timeout': 10
+            })
             wst.daemon = True
             wst.start()
-            
-            # Esperar a que se conecte con timeout
-            timeout = 15
+
+            # Esperar a que se conecte
+            timeout = 10
             start_time = time.time()
             while not self.connected and time.time() - start_time < timeout:
                 time.sleep(0.1)
-                
-            if self.connected:
-                print("✅ Conexión exitosa a Deriv API")
-                return True
-            else:
-                print("❌ Timeout en conexión a Deriv API")
-                return False
-                
+
+            return self.connected
         except Exception as e:
             print(f"❌ Error en conexión: {e}")
             return False
 
     def disconnect(self):
-        """Desconecta limpiamente"""
+        """Cierra la conexión WebSocket"""
         if self.ws:
-            try:
-                self.ws.close()
-            except:
-                pass
-        self.connected = False
-        self.authenticated = False
+            self.ws.close()
+            self.connected = False
+            self.authenticated = False
+            print("🔌 Conexión cerrada manualmente")
 
-    def force_reconnect(self):
-        """Fuerza reconexión inmediata"""
-        print("🔄 Forzando reconexión inmediata...")
-        self.disconnect()
-        time.sleep(2)
-        return self.connect()
-
-    def on_open(self, ws): 
-        print("✅ Conexión WebSocket abierta")
+    def on_open(self, ws):
+        print("✅ Conexión abierta")
         self.connected = True
         ws.send(json.dumps({"authorize": self.token}))
 
-    def on_close(self, ws, code, msg): 
-        print("🔌 Conexión WebSocket cerrada")
+    def on_close(self, ws, close_status_code, close_msg):
+        print("🔌 Conexión cerrada")
         self.connected = False
         self.authenticated = False
 
-    def on_error(self, ws, error): 
+    def on_error(self, ws, error):
         print(f"❌ Error WebSocket: {error}")
 
     def on_message(self, ws, message):
         data = json.loads(message)
-        if "error" in data: 
-            print(f"❌ Error: {data['error'].get('message', 'Error')}")
-        elif "authorize" in data: 
-            print("✅ Autenticación exitosa.")
+        if "error" in data:
+            print(f"❌ Error: {data['error'].get('message', 'Error desconocido')}")
+            return
+        if "authorize" in data:
             self.authenticated = True
+            print("✅ Autenticación exitosa.")
             self.subscribe_to_ticks()
-        elif "tick" in data: 
+        elif "tick" in data:
             self.handle_tick(data['tick'])
 
-    def subscribe_to_ticks(self): 
+    def subscribe_to_ticks(self):
         print(f"📊 Suscribiendo a ticks de {self.symbol}...")
         self.ws.send(json.dumps({"ticks": self.symbol, "subscribe": 1}))
+        print("⏳ Recopilando datos para formar la primera vela...")
 
     def handle_tick(self, tick):
         try:
             price = float(tick['quote'])
             timestamp = int(tick['epoch'])
-            current_ltf_start_time = timestamp - (timestamp % self.ltf_interval_seconds)
-            
-            if self.last_ltf_candle_timestamp == 0: 
-                self.last_ltf_candle_timestamp = current_ltf_start_time
-            
-            if current_ltf_start_time > self.last_ltf_candle_timestamp:
-                self._finalize_ltf_candle()
-                self.last_ltf_candle_timestamp = current_ltf_start_time
-            
+
+            current_candle_start_time = timestamp - (timestamp % self.candle_interval_seconds)
+
+            if self.last_candle_timestamp == 0:
+                self.last_candle_timestamp = current_candle_start_time
+
+            if current_candle_start_time > self.last_candle_timestamp:
+                self._finalize_candle()
+                self.last_candle_timestamp = current_candle_start_time
+
             self.ticks_for_current_candle.append(price)
+
         except Exception as e:
             print(f"❌ Error en handle_tick: {e}")
 
-    def _finalize_ltf_candle(self):
-        if not self.ticks_for_current_candle: 
+    def _finalize_candle(self):
+        if not self.ticks_for_current_candle:
             return
-        
+
         prices = np.array(self.ticks_for_current_candle)
         candle = {
-            'timestamp': self.last_ltf_candle_timestamp, 
-            'open': prices[0], 
+            'timestamp': self.last_candle_timestamp,
+            'open': prices[0],
             'high': np.max(prices),
-            'low': np.min(prices), 
-            'close': prices[-1], 
+            'low': np.min(prices),
+            'close': prices[-1],
             'volume': len(prices)
         }
-        
-        self.ltf_candles.append(candle)
+        self.candles.append(candle)
         self.ticks_for_current_candle = []
-        self.new_ltf_candle_ready = True
+        self.new_candle_ready = True
 
-        if len(self.ltf_candles) < self.min_ltf_candles:
-            print(f"\r⏳ Recopilando velas iniciales (1min): {len(self.ltf_candles)}/{self.min_ltf_candles}", end="")
-        elif len(self.ltf_candles) == self.min_ltf_candles:
-            print(f"\n✅ Recopilación de {self.min_ltf_candles} velas completa. Iniciando análisis de mercado...")
-
-        if self.last_htf_candle_timestamp == 0:
-            self.last_htf_candle_timestamp = candle['timestamp'] - (candle['timestamp'] % self.htf_interval_seconds)
-
-        if candle['timestamp'] >= self.last_htf_candle_timestamp + self.htf_interval_seconds:
-            self._build_and_analyze_htf_candle()
-            self.last_htf_candle_timestamp += self.htf_interval_seconds
-
-    def _build_and_analyze_htf_candle(self):
-        num_ltf_in_htf = self.htf_interval_seconds // self.ltf_interval_seconds
-        candles_for_htf = list(self.ltf_candles)[-num_ltf_in_htf:]
-        if not candles_for_htf: 
-            return
-
-        htf_open = candles_for_htf[0]['open']
-        htf_high = max(c['high'] for c in candles_for_htf)
-        htf_low = min(c['low'] for c in candles_for_htf)
-        htf_close = candles_for_htf[-1]['close']
-        htf_volume = sum(c['volume'] for c in candles_for_htf)
-
-        htf_candle = {
-            'timestamp': self.last_htf_candle_timestamp, 
-            'open': htf_open, 
-            'high': htf_high,
-            'low': htf_low, 
-            'close': htf_close, 
-            'volume': htf_volume
-        }
-        self.htf_candles.append(htf_candle)
-
-        if len(self.htf_candles) >= self.min_htf_candles:
-            # Calcular EMA manualmente para la tendencia HTF
-            htf_closes = np.array([c['close'] for c in self.htf_candles], dtype=float)
-            htf_ema = self.calculate_ema(htf_closes, self.htf_trend_ema_period)
-            
-            old_trend = self.dominant_trend
-            if not np.isnan(htf_ema[-1]):
-                if htf_closes[-1] > htf_ema[-1]: 
-                    self.dominant_trend = "UP"
-                elif htf_closes[-1] < htf_ema[-1]: 
-                    self.dominant_trend = "DOWN"
-                else: 
-                    self.dominant_trend = "NEUTRAL"
-
-            if self.dominant_trend != old_trend and self.dominant_trend != "NEUTRAL":
-                trend_color = "\033[92m" if self.dominant_trend == "UP" else "\033[91m"
-                print(f"\n{trend_color}📈 TENDENCIA DOMINANTE (5min) CAMBIÓ A: {self.dominant_trend}\033[0m")
-                
-                if self.telegram_enabled:
-                    trend_emoji = "📈" if self.dominant_trend == "UP" else "📉"
-                    message = f"{trend_emoji} <b>TENDENCIA CAMBIADA</b>\n\n"
-                    message += f"<b>Par:</b> {self.symbol}\n"
-                    message += f"<b>Timeframe:</b> 5min\n"
-                    message += f"<b>Nueva Tendencia:</b> {self.dominant_trend}\n"
-                    message += f"<b>Hora:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    self.send_telegram_message(message)
+        if len(self.candles) >= self.min_candles:
+            print(f"🕯️ Nueva vela cerrada. Total: {len(self.candles)}. Precio Cierre: {candle['close']:.2f}")
 
     def analyze_market(self):
-        if len(self.ltf_candles) < self.min_ltf_candles or self.active_trade: 
+        if len(self.candles) < self.min_candles:
+            print(f"\r⏳ Recopilando velas iniciales: {len(self.candles)}/{self.min_candles}", end="")
             return
 
-        # Convertir a arrays de numpy
-        opens = np.array([c['open'] for c in self.ltf_candles], dtype=float)
-        highs = np.array([c['high'] for c in self.ltf_candles], dtype=float)
-        lows = np.array([c['low'] for c in self.ltf_candles], dtype=float)
-        closes = np.array([c['close'] for c in self.ltf_candles], dtype=float)
-        volumes = np.array([c['volume'] for c in self.ltf_candles], dtype=float)
+        # Extraer arrays de numpy
+        opens = np.array([c['open'] for c in self.candles], dtype=float)
+        highs = np.array([c['high'] for c in self.candles], dtype=float)
+        lows = np.array([c['low'] for c in self.candles], dtype=float)
+        closes = np.array([c['close'] for c in self.candles], dtype=float)
+        volumes = np.array([c['volume'] for c in self.candles], dtype=float)
 
-        # Calcular indicadores manualmente
-        ema_fast = self.calculate_ema(closes, self.ema_fast_period)
-        ema_slow = self.calculate_ema(closes, self.ema_slow_period)
-        ema_trend = self.calculate_ema(closes, self.ema_trend_period)
-        rsi = self.calculate_rsi(closes, self.rsi_period)
-        atr = self.calculate_atr(highs, lows, closes, self.atr_period)
-        volume_ema = self.calculate_volume_ema(volumes, self.volume_ema_period)
-        
-        # Calcular patrón engulfing manualmente
-        engulfing = np.zeros(len(closes))
-        for i in range(1, len(closes)):
-            prev_open, prev_close = opens[i-1], closes[i-1]
-            curr_open, curr_close = opens[i], closes[i]
-            
-            # Bullish engulfing
-            if (curr_close > curr_open and prev_close < prev_open and 
-                curr_open < prev_close and curr_close > prev_open):
-                engulfing[i] = 100
-            # Bearish engulfing
-            elif (curr_close < curr_open and prev_close > prev_open and 
-                  curr_open > prev_close and curr_close < prev_open):
-                engulfing[i] = -100
+        try:
+            # Calcular todos los indicadores
+            indicators = self.calculate_indicators(closes, highs, lows, volumes)
+            ema_fast = indicators['ema_fast']
+            ema_slow = indicators['ema_slow']
+            ema_trend = indicators['ema_trend']
+            macd = indicators['macd']
+            macd_signal = indicators['macd_signal']
+            rsi = indicators['rsi']
+            stoch_k = indicators['stoch_k']
+            stoch_d = indicators['stoch_d']
+            atr = indicators['atr']
+            volume_ma = indicators['volume_ma']
+        except Exception as e:
+            print(f"❌ Error calculando indicadores: {e}")
+            return
 
-        # Verificar si tenemos datos suficientes
-        if (np.isnan(ema_fast[-1]) or np.isnan(ema_slow[-1]) or np.isnan(ema_trend[-1]) or 
-            np.isnan(rsi[-1]) or np.isnan(atr[-1]) or np.isnan(volume_ema[-1])):
+        # Verificar si tenemos suficientes datos para análisis
+        if (len(closes) < self.ema_trend_period or
+            np.isnan(ema_fast[-1]) or np.isnan(ema_slow[-1]) or
+            np.isnan(rsi[-1]) or np.isnan(atr[-1])):
             return
 
         last_close = closes[-1]
         last_atr = atr[-1]
-        is_volume_spike = volumes[-1] > volume_ema[-1] * 1.2
-        is_bullish_engulfing = engulfing[-1] == 100
-        is_bearish_engulfing = engulfing[-1] == -100
+        current_volume = volumes[-1]
+        avg_volume = volume_ma[-1] if not np.isnan(volume_ma[-1]) else current_volume
+
+        # Condiciones de tendencia mejoradas
+        is_strong_uptrend = (ema_fast[-1] > ema_slow[-1] and
+                            ema_slow[-1] > ema_trend[-1] and
+                            closes[-1] > ema_trend[-1])
+
+        is_strong_downtrend = (ema_fast[-1] < ema_slow[-1] and
+                              ema_slow[-1] < ema_trend[-1] and
+                              closes[-1] < ema_trend[-1])
+
+        # Condiciones de momentum
+        macd_bullish = macd[-1] > macd_signal[-1] and macd[-2] <= macd_signal[-2]
+        macd_bearish = macd[-1] < macd_signal[-1] and macd[-2] >= macd_signal[-2]
+
+        stoch_not_overbought = stoch_k[-1] < 80 and stoch_d[-1] < 80
+        stoch_not_oversold = stoch_k[-1] > 20 and stoch_d[-1] > 20
+
+        # Condiciones de volumen
+        volume_ok = current_volume > avg_volume * 0.8  # Volumen al menos 80% del promedio
 
         signal = None
-        reason = ""
-        
-        if time.time() - self.last_signal_time < self.signal_cooldown: 
+        current_time = time.time()
+
+        if current_time - self.last_signal_time < self.signal_cooldown:
             return
 
-        if self.dominant_trend == "UP":
-            is_uptrend_ltf = ema_fast[-1] > ema_slow[-1] and ema_slow[-1] > ema_trend[-1]
-            is_ema_cross_up = len(ema_fast) > 1 and ema_fast[-2] <= ema_slow[-2] and ema_fast[-1] > ema_slow[-1]
-            
-            if is_uptrend_ltf and is_ema_cross_up and is_volume_spike:
-                signal = "BUY"
-                reason = "Cruce de EMAs (LTF) con Tendencia (HTF)"
-            if is_bullish_engulfing and is_uptrend_ltf and rsi[-1] < 75 and is_volume_spike:
-                signal = "BUY"
-                reason = "Vela Envolvente (LTF) con Tendencia (HTF)"
+        # MODIFICACIÓN: ELIMINADA LA SEÑAL DE COMPRA (BUY)
+        # Solo generamos señales de VENTA (SELL)
 
-        if self.dominant_trend == "DOWN":
-            is_downtrend_ltf = ema_fast[-1] < ema_slow[-1] and ema_slow[-1] < ema_trend[-1]
-            is_ema_cross_down = len(ema_fast) > 1 and ema_fast[-2] >= ema_slow[-2] and ema_fast[-1] < ema_slow[-1]
-            
-            if is_downtrend_ltf and is_ema_cross_down and is_volume_spike:
+        # Señal de VENTA (SELL) - Condiciones más estrictas
+        if (is_strong_downtrend and
+              macd_bearish and
+              rsi[-1] < 55 and rsi[-1] > 30 and  # RSI en zona favorable
+              stoch_not_oversold and
+              volume_ok):
+
+            # Verificar si ya hemos tenido muchas señales SELL consecutivas
+            if (self.last_signal is None or
+                self.last_signal['direction'] != 'SELL' or
+                self.consecutive_signals < self.max_consecutive_signals):
+
                 signal = "SELL"
-                reason = "Cruce de EMAs (LTF) con Tendencia (HTF)"
-            if is_bearish_engulfing and is_downtrend_ltf and rsi[-1] > 25 and is_volume_spike:
-                signal = "SELL"
-                reason = "Vela Envolvente (LTF) con Tendencia (HTF)"
+                if self.last_signal and self.last_signal['direction'] == 'SELL':
+                    self.consecutive_signals += 1
+                else:
+                    self.consecutive_signals = 1
 
         if signal:
-            self.last_signal_time = time.time()
-            self.display_signal(signal, reason, last_close, last_atr, rsi[-1])
-            sl, tp = self.calculate_tp_sl(signal, last_close, last_atr)
-            self.active_trade = {"direction": signal, "entry": last_close, "sl": sl, "tp": tp}
-            
+            self.last_signal_time = current_time
+            self.last_signal = {
+                'direction': signal,
+                'price': last_close,
+                'atr': last_atr,
+                'rsi': rsi[-1],
+                'stoch_k': stoch_k[-1] if not np.isnan(stoch_k[-1]) else 0,
+                'stoch_d': stoch_d[-1] if not np.isnan(stoch_d[-1]) else 0,
+                'macd': macd[-1] if not np.isnan(macd[-1]) else 0,
+                'volume_ratio': current_volume / avg_volume if avg_volume > 0 else 1,
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+            self.signals_history.append(self.last_signal)
+
+            self.display_signal(signal, last_close, last_atr, rsi[-1],
+                               stoch_k[-1], stoch_d[-1], macd[-1],
+                               current_volume / avg_volume if avg_volume > 0 else 1)
+
+            # Enviar señal a Telegram
             if self.telegram_enabled:
-                self.send_signal_to_telegram(signal, reason, last_close, sl, tp, rsi[-1])
+                telegram_msg = self.format_telegram_message(
+                    signal, last_close, last_atr, rsi[-1],
+                    stoch_k[-1], stoch_d[-1], macd[-1],
+                    current_volume / avg_volume if avg_volume > 0 else 1
+                )
+                self.send_telegram_message(telegram_msg)
 
-    def send_signal_to_telegram(self, signal, reason, price, sl, tp, rsi):
-        """Envía una señal de trading a Telegram"""
-        direction_emoji = "🟢" if signal == "BUY" else "🔴"
-        message = f"{direction_emoji} <b>SEÑAL DE TRADING</b> {direction_emoji}\n\n"
-        message += f"<b>Par:</b> {self.symbol}\n"
-        message += f"<b>Dirección:</b> {signal}\n"
-        message += f"<b>Precio:</b> {price:.2f}\n"
-        message += f"<b>Take Profit:</b> {tp:.2f}\n"
-        message += f"<b>Stop Loss:</b> {sl:.2f}\n"
-        message += f"<b>RSI:</b> {rsi:.2f}\n"
-        message += f"<b>Razón:</b> {reason}\n"
-        message += f"<b>Tendencia HTF:</b> {self.dominant_trend}\n"
-        message += f"<b>Hora:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        message += "#TradingSignal #BOOM1000"
-        
-        self.send_telegram_message(message)
+    def format_telegram_message(self, direction, price, atr_value, rsi_value,
+                               stoch_k, stoch_d, macd_value, volume_ratio):
+        # MODIFICACIÓN: Solo manejamos señales SELL
+        sl = price + (atr_value * self.sl_atr_multiplier)
+        tp = price - (atr_value * self.tp_atr_multiplier)
+        direction_emoji = "📉"
 
-    def check_active_trade(self):
-        if not self.active_trade: 
-            return
-        
-        last_price = self.ltf_candles[-1]['close'] if self.ltf_candles else 0
-        if not last_price: 
-            return
-        
-        trade = self.active_trade
-        exit_reason = None
-        
-        if trade['direction'] == "BUY":
-            if last_price >= trade['tp']: 
-                exit_reason = "Take Profit"
-            elif last_price <= trade['sl']: 
-                exit_reason = "Stop Loss"
-        elif trade['direction'] == "SELL":
-            if last_price <= trade['tp']: 
-                exit_reason = "Take Profit"
-            elif last_price >= trade['sl']: 
-                exit_reason = "Stop Loss"
-                
-        if exit_reason:
-            print(f"\n🔔 CIERRE DE OPERACIÓN ({trade['direction']}): {exit_reason} en {last_price:.2f}")
-            
-            if self.telegram_enabled:
-                result_emoji = "✅" if exit_reason == "Take Profit" else "❌"
-                message = f"{result_emoji} <b>OPERACIÓN CERRADA</b> {result_emoji}\n\n"
-                message += f"<b>Par:</b> {self.symbol}\n"
-                message += f"<b>Dirección:</b> {trade['direction']}\n"
-                message += f"<b>Entrada:</b> {trade['entry']:.2f}\n"
-                message += f"<b>Salida:</b> {last_price:.2f}\n"
-                message += f"<b>Resultado:</b> {exit_reason}\n"
-                
-                if exit_reason == "Take Profit":
-                    profit = last_price - trade['entry'] if trade['direction'] == "BUY" else trade['entry'] - last_price
-                    message += f"<b>Ganancia:</b> {profit:.2f} puntos\n"
-                
-                message += f"<b>Hora:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                self.send_telegram_message(message)
-                
-            self.active_trade = None
+        message = f"""
+🚀 <b>SEÑAL DE TRADING - BOOM 1000</b> 🚀
 
-    def calculate_tp_sl(self, direction, price, atr_value):
-        if direction == "BUY": 
-            return round(price - (atr_value * self.sl_atr_multiplier), 2), round(price + (atr_value * self.tp_atr_multiplier), 2)
-        else: 
-            return round(price + (atr_value * self.sl_atr_multiplier), 2), round(price - (atr_value * self.tp_atr_multiplier), 2)
+{direction_emoji} <b>Dirección:</b> {direction}
+💰 <b>Precio Entrada:</b> {price:.2f}
+🎯 <b>Take Profit:</b> {tp:.2f}
+🛑 <b>Stop Loss:</b> {sl:.2f}
 
-    def display_signal(self, direction, reason, price, atr_value, rsi_value):
-        sl, tp = self.calculate_tp_sl(direction, price, atr_value)
-        color = "\033[92m" if direction == "BUY" else "\033[91m"
-        reset = "\033[0m"
-        
+📊 <b>Indicadores:</b>
+   • RSI: {rsi_value:.1f}
+   • ATR: {atr_value:.2f}
+   • Estocástico K: {stoch_k:.1f}, D: {stoch_d:.1f}
+   • MACD: {macd_value:.4f}
+   • Volumen: {volume_ratio:.2f}x promedio
+
+⏰ <b>Hora:</b> {datetime.now().strftime('%H:%M:%S')}
+
+#Trading #Señal #BOOM1000
+"""
+        return message
+
+    def display_signal(self, direction, price, atr_value, rsi_value,
+                      stoch_k, stoch_d, macd_value, volume_ratio):
+        # MODIFICACIÓN: Solo manejamos señales SELL
+        sl = price + (atr_value * self.sl_atr_multiplier)
+        tp = price - (atr_value * self.tp_atr_multiplier)
+        color_code = "\033[91m"
+
+        reset_code = "\033[0m"
+
         print("\n" + "="*70)
-        print(f"🎯 {color}SEÑAL MTF DETECTADA - {direction} (TENDENCIA 5MIN: {self.dominant_trend}){reset}")
+        print(f"🎯 {color_code}NUEVA SEÑAL DE TRADING - BOOM 1000{reset_code}")
         print("="*70)
-        print(f"   🧠 Razón: {reason}")
-        print(f"   💰 Precio: {price:.2f} | 🎯 TP: {tp:.2f} | 🛑 SL: {sl:.2f} | 📊 RSI: {rsi_value:.1f}")
+        print(f"   📈 Dirección: {color_code}{direction}{reset_code}")
+        print(f"   💰 Precio de Entrada: {price:.2f}")
+        print(f"   🎯 Take Profit (TP): {tp:.2f} (Basado en ATR x{self.tp_atr_multiplier})")
+        print(f"   🛑 Stop Loss (SL): {sl:.2f} (Basado en ATR x{self.sl_atr_multiplier})")
+        print(f"   ⏰ Hora: {datetime.now().strftime('%H:%M:%S')}")
+        print(f"   📊 Indicadores: RSI={rsi_value:.1f}, ATR={atr_value:.2f}")
+        print(f"   📈 Estocástico: K={stoch_k:.1f}, D={stoch_d:.1f}")
+        print(f"   📉 MACD: {macd_value:.4f}")
+        print(f"   🔊 Volumen: {volume_ratio:.2f}x promedio")
         print("="*70)
 
     def run_analyzer(self):
         print("\n" + "="*70)
-        print("🤖 ANALIZADOR MTF BOOM 1000 v4.1 (Indicadores Manuales)")
+        print("🤖 ANALIZADOR BOOM 1000 v3.0 - ESTRATEGIA MEJORADA")
         print("="*70)
-        print("💡 ESTRATEGIA: Tendencia en 5min (HTF) + Entradas en 1min (LTF)")
-        
+        print("🧠 ESTRATEGIA MEJORADA:")
+        print(f"   • Análisis en velas de {self.candle_interval_seconds} segundos.")
+        print(f"   • Filtro de tendencia con EMA {self.ema_trend_period}.")
+        print(f"   • Entrada por cruce de EMAs {self.ema_fast_period}/{self.ema_slow_period}.")
+        print(f"   • Confirmación con MACD({self.macd_fast},{self.macd_slow},{self.macd_signal}).")
+        print(f"   • Filtro RSI({self.rsi_period}) y Estocástico({self.stoch_k},{self.stoch_d}).")
+        print(f"   • Filtro de volumen con MA({self.volume_ma_period}).")
+        print(f"   • TP/SL dinámico con ATR({self.atr_period}) x{self.tp_atr_multiplier}/{self.sl_atr_multiplier}.")
+        print("   ⚠️  MODIFICACIÓN: Solo genera señales SELL")
+
         if self.telegram_enabled:
-            print("📱 NOTIFICACIONES: Telegram habilitado")
+            print("   📱 Notificaciones Telegram: ACTIVADAS")
         else:
-            print("📱 NOTIFICACIONES: Telegram deshabilitado")
-        
+            print("   📱 Notificaciones Telegram: DESACTIVADAS")
+
         print("="*70)
-        
-        # Bucle principal con reconexión automática agresiva
+
+        # Bucle principal con reconexión automática y auto-ping
+        reconnect_interval = 15 * 60  # 15 minutos en segundos
+        ping_interval = 10 * 60       # 10 minutos en segundos (antes de que Render duerma)
+
+        last_ping_time = time.time()
+        last_reconnect_time = time.time()
+
         while True:
             try:
                 current_time = time.time()
-                
-                # Reconectar si no está conectado o cada 5 minutos
-                if not self.connected or current_time - self.last_reconnect_attempt > 300:
-                    self.last_reconnect_attempt = current_time
-                    
-                    if not self.connected:
-                        print("🔄 Intentando reconexión automática...")
-                    else:
-                        print("🔄 Reconexión programada cada 5 minutos...")
-                    
+
+                # Auto-ping cada 10 minutos para evitar que Render duerma el servicio
+                if current_time - last_ping_time >= ping_interval:
+                    print("🔄 Realizando auto-ping para mantener servicio activo...")
+                    self.self_ping()
+                    last_ping_time = current_time
+
+                # Reconectar cada 15 minutos o si no está conectado
+                if not self.connected or current_time - last_reconnect_time >= reconnect_interval:
+                    if self.connected:
+                        print("🔄 Reconexión programada (cada 15 minutos)...")
+                        self.disconnect()
+                        time.sleep(2)
+
+                    last_reconnect_time = current_time
+
                     if self.connect():
                         print("✅ Reconexión exitosa")
                         # Bucle de análisis mientras esté conectado
                         while self.connected:
-                            if self.new_ltf_candle_ready:
-                                if self.active_trade: 
-                                    self.check_active_trade()
-                                else: 
-                                    self.analyze_market()
-                                self.new_ltf_candle_ready = False
+                            if self.new_candle_ready:
+                                self.analyze_market()
+                                self.new_candle_ready = False
                             time.sleep(1)
                     else:
                         print("❌ No se pudo conectar, reintentando en 30 segundos...")
                         time.sleep(30)
                 else:
-                    # Esperar hasta la próxima reconexión
-                    time_until_reconnect = 300 - (current_time - self.last_reconnect_attempt)
-                    if time_until_reconnect > 0:
-                        sleep_time = min(30, time_until_reconnect)
-                        print(f"⏰ Próxima reconexión en {time_until_reconnect:.0f} segundos")
+                    # Esperar hasta que sea tiempo de reconectar o hacer ping
+                    next_action = min(
+                        reconnect_interval - (current_time - last_reconnect_time),
+                        ping_interval - (current_time - last_ping_time)
+                    )
+                    if next_action > 0:
+                        sleep_time = min(60, next_action)  # Esperar máximo 1 minuto
+                        print(f"⏰ Próxima acción en {sleep_time:.0f} segundos")
                         time.sleep(sleep_time)
-                    
+
             except Exception as e:
                 print(f"❌ Error crítico en run_analyzer: {e}")
                 print("🔄 Reintentando en 30 segundos...")
@@ -547,60 +612,39 @@ analyzer = None
 def home():
     return jsonify({
         "status": "running",
-        "service": "BOOM1000 MTF Analyzer",
+        "service": "BOOM 1000 Analyzer v3.0",
         "connected": analyzer.connected if analyzer else False,
-        "authenticated": analyzer.authenticated if analyzer else False,
-        "dominant_trend": analyzer.dominant_trend if analyzer else "NEUTRAL",
-        "active_trade": analyzer.active_trade if analyzer else None,
-        "total_ltf_candles": len(analyzer.ltf_candles) if analyzer else 0,
-        "last_reconnect": analyzer.last_reconnect_attempt if analyzer else 0,
-        "next_reconnect": (analyzer.last_reconnect_attempt + 300 - time.time()) if analyzer and analyzer.last_reconnect_attempt else 0
+        "last_signal": analyzer.last_signal if analyzer else None,
+        "total_candles": len(analyzer.candles) if analyzer else 0,
+        "next_reconnect": analyzer.last_reconnect_time + (15 * 60) - time.time() if analyzer and hasattr(analyzer, 'last_reconnect_time') else 0
     })
 
 @app.route('/health')
 def health():
     return jsonify({
-        "status": "healthy", 
+        "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "connected": analyzer.connected if analyzer else False,
-        "authenticated": analyzer.authenticated if analyzer else False
+        "connected": analyzer.connected if analyzer else False
     })
 
 @app.route('/signals')
 def signals():
     if not analyzer:
         return jsonify({"error": "Analyzer not initialized"})
-    
+
     return jsonify({
-        "dominant_trend": analyzer.dominant_trend,
-        "active_trade": analyzer.active_trade,
-        "last_signal_time": analyzer.last_signal_time,
-        "total_signals": len(analyzer.ltf_candles) - 50 if len(analyzer.ltf_candles) > 50 else 0
+        "last_signal": analyzer.last_signal,
+        "history": analyzer.signals_history[-10:] if analyzer.signals_history else [],
+        "total_signals": len(analyzer.signals_history)
     })
 
 @app.route('/reconnect')
 def manual_reconnect():
     if not analyzer:
         return jsonify({"error": "Analyzer not initialized"})
-    
-    analyzer.last_reconnect_attempt = 0  # Forzar reconexión inmediata
-    return jsonify({"status": "reconnection_triggered", "message": "Se forzará la reconexión en el próximo ciclo"})
 
-@app.route('/debug')
-def debug():
-    if not analyzer:
-        return jsonify({"error": "Analyzer not initialized"})
-    
-    return jsonify({
-        "connected": analyzer.connected,
-        "authenticated": analyzer.authenticated,
-        "websocket_status": "open" if analyzer.ws and analyzer.connected else "closed",
-        "ltf_candles": len(analyzer.ltf_candles),
-        "htf_candles": len(analyzer.htf_candles),
-        "ticks_in_current_candle": len(analyzer.ticks_for_current_candle),
-        "last_reconnect_attempt": analyzer.last_reconnect_attempt,
-        "dominant_trend": analyzer.dominant_trend
-    })
+    analyzer.last_reconnect_time = 0  # Forzar reconexión inmediata
+    return jsonify({"status": "reconnection_triggered", "message": "Se forzará la reconexión en el próximo ciclo"})
 
 def cleanup():
     print("🛑 Cerrando conexiones...")
@@ -610,18 +654,18 @@ def cleanup():
 atexit.register(cleanup)
 
 if __name__ == "__main__":
+    # Configuración
     DEMO_TOKEN = "a1-m63zGttjKYP6vUq8SIJdmySH8d3Jc"
-    
-    # Configuración de Telegram
     TELEGRAM_BOT_TOKEN = "7868591681:AAGYeuSUwozg3xTi1zmxPx9gWRP2xsXP0Uc"
     TELEGRAM_CHAT_ID = "-1003028922957"
-    
-    analyzer = BOOM1000MTFAnalyzer(
-        token=DEMO_TOKEN, 
-        telegram_token=TELEGRAM_BOT_TOKEN, 
+
+    # Inicializar analizador
+    analyzer = BOOM1000CandleAnalyzer(
+        DEMO_TOKEN,
+        telegram_token=TELEGRAM_BOT_TOKEN,
         telegram_chat_id=TELEGRAM_CHAT_ID
     )
-    
+
     # Iniciar servidor Flask
     print("🚀 Iniciando servidor Flask...")
     app.run(host='0.0.0.0', port=10000, debug=False)
